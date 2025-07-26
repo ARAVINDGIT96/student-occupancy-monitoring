@@ -1,151 +1,132 @@
+import cv2
+import numpy as np
 import streamlit as st
-import pandas as pd
-import math
-from pathlib import Path
+import time
+from collections import deque
 
-# Set the title and favicon that appear in the Browser's tab bar.
-st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
-)
+LOGO_TEXT = "STUDENT MONITORING & OCCUPANCY ANALYTICS"
+st.set_page_config(layout="wide")
+st.title(LOGO_TEXT)
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
+source = st.radio("Choose video source", ["Webcam", "Upload Video"])
+if source == "Upload Video":
+    uploaded_file = st.file_uploader("Upload a video file", type=["mp4", "avi"])
+    if uploaded_file:
+        source_choice = uploaded_file.name
+        with open(source_choice, "wb") as f:
+            f.write(uploaded_file.read())
+    else:
+        st.warning("Please upload a video file to continue.")
+        st.stop()
+else:
+    source_choice = 0
 
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
+cap = cv2.VideoCapture(source_choice)
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+if face_cascade.empty():
+    st.error("Error: Haar Cascade could not be loaded.")
+    st.stop()
 
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
+def define_zones(frame_width, frame_height):
+    zone_width = frame_width // 3
+    return [(i * zone_width, 0, zone_width, frame_height) for i in range(3)]
 
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
+def detect_people(frame):
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=4, minSize=(40, 40))
 
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
+def count_people_in_zones(faces, zones):
+    counts = [0] * len(zones)
+    for (x, y, w, h) in faces:
+        cx, cy = x + w // 2, y + h // 2
+        for i, (zx, zy, zw, zh) in enumerate(zones):
+            if zx <= cx < zx + zw and zy <= cy < zy + zh:
+                counts[i] += 1
+                break
+    return counts
 
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
+def draw_zones(frame, zones, counts):
+    overlay = frame.copy()
+    colors = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+    for i, (x, y, w, h) in enumerate(zones):
+        cv2.rectangle(overlay, (x, y), (x + w, y + h), colors[i], 2)
+        cv2.putText(overlay, f"Zone {i+1}: {counts[i]} people", (x + 10, y + 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, colors[i], 2)
+    return cv2.addWeighted(overlay, 0.3, frame, 0.7, 0)
 
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
+def generate_heatmap(frame, heatmap_accum):
+    heatmap = cv2.applyColorMap(cv2.convertScaleAbs(heatmap_accum, alpha=0.5), cv2.COLORMAP_JET)
+    return cv2.addWeighted(frame, 0.7, heatmap, 0.3, 0)
 
-    return gdp_df
+run = st.checkbox("▶ Start Monitoring")
+show_heatmap = st.sidebar.checkbox("Show Heatmap Overlay", value=True)
+col1, col2 = st.columns([1, 2])
 
-gdp_df = get_gdp_data()
+history_length = 50
+engagement_history = deque(maxlen=history_length)
+OVER_CROWD_THRESHOLD = 2
+LOW_ACTIVITY_THRESHOLD = 5
+MAX_PEOPLE_PER_ZONE = 5
 
-# -----------------------------------------------------------------------------
-# Draw the actual page
+if run:
+    video_placeholder = col2.empty()
+    occupied_text = col1.empty()
+    area_usage_text = col1.empty()
+    crowd_status_text = col1.empty()
+    alert_text = col1.empty()
+    engagement_trend_text = col1.empty()
+    heatmap_accum = None
 
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            st.warning("Video ended or cannot read frame.")
+            break
 
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
+        frame_height, frame_width = frame.shape[:2]
+        zones = define_zones(frame_width, frame_height)
+        faces = detect_people(frame)
+        counts_per_zone = count_people_in_zones(faces, zones)
+        total_occupied = sum(counts_per_zone)
+        engagement_history.append(total_occupied)
+        area_usages = [(count / MAX_PEOPLE_PER_ZONE) * 100 for count in counts_per_zone]
 
-# Add some spacing
-''
-''
+        for (x, y, w, h) in faces:
+            cv2.rectangle(frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
 
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
+        frame = draw_zones(frame, zones, counts_per_zone)
 
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
+        if heatmap_accum is None:
+            heatmap_accum = np.zeros((frame_height, frame_width), dtype=np.float32)
 
-countries = gdp_df['Country Code'].unique()
+        for (x, y, w, h) in faces:
+            cx, cy = x + w // 2, y + h // 2
+            if 0 <= cx < frame_width and 0 <= cy < frame_height:
+                heatmap_accum[cy, cx] += 1
 
-if not len(countries):
-    st.warning("Select at least one country")
+        heatmap_accum = cv2.GaussianBlur(heatmap_accum, (0, 0), sigmaX=15, sigmaY=15)
+        heatmap_accum *= 0.95
+        frame_with_heatmap = generate_heatmap(frame.copy(), heatmap_accum) if show_heatmap else frame.copy()
 
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
+        crowd_status = "Normal"
+        alert_msg = ""
+        if total_occupied == 0:
+            crowd_status = "Empty"
+            alert_msg = "⚠ Alert: No activity detected!"
+        elif total_occupied > OVER_CROWD_THRESHOLD:
+            crowd_status = "Overcrowded"
+            alert_msg = "⚠ Alert: Overcrowding detected!"
+        elif total_occupied < LOW_ACTIVITY_THRESHOLD:
+            crowd_status = "Low Crowded"
+            alert_msg = "⚠ Alert: Low activity detected!"
 
-''
-''
-''
+        occupied_text.markdown(f"*Occupied Count:* {total_occupied}")
+        area_usage_text.markdown(f"📈 *Zone Usage (%):* {', '.join(f'{u:.1f}%' for u in area_usages)}")
+        crowd_status_text.markdown(f"📊 *Crowd Status:* {crowd_status}")
+        alert_text.markdown(f"{alert_msg}" if alert_msg else "")
+        engagement_trend_text.line_chart(list(engagement_history), height=150)
+        video_placeholder.image(cv2.cvtColor(frame_with_heatmap, cv2.COLOR_BGR2RGB), channels="RGB")
 
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
-]
+        if source == "Upload Video":
+            time.sleep(0.05)
 
-st.header('GDP over time', divider='gray')
-
-''
-
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
-)
-
-''
-''
-
-
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
-
-st.header(f'GDP in {to_year}', divider='gray')
-
-''
-
-cols = st.columns(4)
-
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
-
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
-        else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
-
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
-        )
+    cap.release()
